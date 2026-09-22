@@ -1,0 +1,58 @@
+name: Safari WebDriver smoke test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  safari-webdriver:
+    name: Start Safari WebDriver
+    runs-on: macos-14
+    timeout-minutes: 10
+
+    steps:
+      - name: Enable Safari WebDriver
+        run: sudo safaridriver --enable
+
+      - name: Start Safari WebDriver
+        run: |
+          safaridriver --diagnose &
+          echo $! > "$RUNNER_TEMP/safaridriver.pid"
+
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:4444/status; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "Safari WebDriver did not become ready"
+          exit 1
+
+      - name: Create and close Safari session
+        run: |
+          session_response=$(curl --fail --silent --show-error \
+            --request POST \
+            --header 'Content-Type: application/json' \
+            --data '{"capabilities":{"alwaysMatch":{"browserName":"safari"}}}' \
+            http://127.0.0.1:4444/session)
+          echo "$session_response"
+
+          session_id=$(printf '%s' "$session_response" | ruby -rjson -e 'puts JSON.parse(STDIN.read).dig("value", "sessionId")')
+          test -n "$session_id"
+
+          curl --fail --silent --show-error \
+            --request DELETE \
+            "http://127.0.0.1:4444/session/$session_id"
+
+      - name: Stop Safari WebDriver
+        if: always()
+        run: |
+          if test -f "$RUNNER_TEMP/safaridriver.pid"; then
+            kill "$(cat "$RUNNER_TEMP/safaridriver.pid")" || true
+          fi

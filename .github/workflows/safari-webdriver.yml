@@ -15,44 +15,107 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 10
 
+    defaults:
+      run:
+        shell: bash
+
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure colored logging
+        run: |
+          mkdir -p "$RUNNER_TEMP/safari-logs"
+          echo "SAFARI_LOG_DIR=$RUNNER_TEMP/safari-logs" >> "$GITHUB_ENV"
+          echo "BASH_ENV=$GITHUB_WORKSPACE/.github/scripts/safari-logging.sh" >> "$GITHUB_ENV"
+
+      - name: Log runner and Safari versions
+        run: |
+          log INFO "Runner: $RUNNER_OS / $RUNNER_ARCH"
+          {
+            sw_vers
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /Applications/Safari.app/Contents/Info.plist
+            /usr/bin/safaridriver --version
+          } 2>&1 | tee "$SAFARI_LOG_DIR/versions.log"
+
       - name: Enable Safari WebDriver
-        run: sudo safaridriver --enable
+        run: |
+          log INFO 'Enabling Safari remote automation'
+          sudo -n /usr/bin/safaridriver --enable 2>&1 | tee "$SAFARI_LOG_DIR/enable.log"
+          log OK 'Safari WebDriver enabled'
 
       - name: Start Safari WebDriver
         run: |
-          safaridriver --diagnose &
-          echo $! > "$RUNNER_TEMP/safaridriver.pid"
+          log INFO 'Starting safaridriver on port 4444 with diagnostics'
+          nohup /usr/bin/safaridriver --port 4444 --diagnose \
+            > "$SAFARI_LOG_DIR/safaridriver.log" 2>&1 < /dev/null &
+          driver_pid=$!
+          echo "$driver_pid" > "$RUNNER_TEMP/safaridriver.pid"
+          log INFO "safaridriver PID: $driver_pid"
 
           for attempt in {1..30}; do
-            if curl --fail --silent --show-error http://127.0.0.1:4444/status; then
+            if ! kill -0 "$driver_pid" 2>/dev/null; then
+              log ERROR 'safaridriver exited before becoming ready'
+              cat "$SAFARI_LOG_DIR/safaridriver.log"
+              exit 1
+            fi
+            log INFO "Readiness attempt $attempt/30"
+            if webdriver_request GET /status "status-$attempt"; then
+              log OK 'Safari WebDriver is reachable'
               exit 0
             fi
             sleep 1
           done
 
-          echo "Safari WebDriver did not become ready"
+          log ERROR 'Safari WebDriver did not become ready'
+          cat "$SAFARI_LOG_DIR/safaridriver.log"
           exit 1
 
       - name: Create and close Safari session
         run: |
-          session_response=$(curl --fail --silent --show-error \
-            --request POST \
-            --header 'Content-Type: application/json' \
-            --data '{"capabilities":{"alwaysMatch":{"browserName":"safari"}}}' \
-            http://127.0.0.1:4444/session)
-          echo "$session_response"
+          webdriver_request POST /session create-session \
+            '{"capabilities":{"alwaysMatch":{"browserName":"safari"}}}'
+          session_id=$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV[0])).dig("value", "sessionId")' "$SAFARI_LOG_DIR/create-session.json")
+          if [[ -z "$session_id" ]]; then
+            log ERROR 'Response did not contain value.sessionId'
+            exit 1
+          fi
+          log OK "Safari session created: $session_id"
+          webdriver_request DELETE "/session/$session_id" delete-session
+          log OK 'Safari session closed'
 
-          session_id=$(printf '%s' "$session_response" | ruby -rjson -e 'puts JSON.parse(STDIN.read).dig("value", "sessionId")')
-          test -n "$session_id"
-
-          curl --fail --silent --show-error \
-            --request DELETE \
-            "http://127.0.0.1:4444/session/$session_id"
-
-      - name: Stop Safari WebDriver
+      - name: Collect diagnostics and stop Safari WebDriver
         if: always()
         run: |
+          mkdir -p "$SAFARI_LOG_DIR"
+          echo '::group::Safari WebDriver process and port diagnostics'
+          { pgrep -lf 'Safari|safaridriver' || true; } | tee "$SAFARI_LOG_DIR/processes.log"
+          { lsof -nP -iTCP:4444 -sTCP:LISTEN || true; } | tee "$SAFARI_LOG_DIR/port.log"
+          echo '::endgroup::'
           if test -f "$RUNNER_TEMP/safaridriver.pid"; then
             kill "$(cat "$RUNNER_TEMP/safaridriver.pid")" || true
           fi
+          echo '::group::Safari WebDriver output'
+          if test -f "$SAFARI_LOG_DIR/safaridriver.log"; then
+            cat "$SAFARI_LOG_DIR/safaridriver.log"
+          fi
+          echo '::endgroup::'
+          if test -d "$HOME/Library/Logs/com.apple.WebDriver"; then
+            cp -R "$HOME/Library/Logs/com.apple.WebDriver" "$SAFARI_LOG_DIR/webdriver-diagnostics"
+          fi
+
+      - name: Upload Safari logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: safari-webdriver-logs-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/safari-logs
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Report failure
+        if: failure()
+        run: |
+          printf '\033[38;2;255;0;0mSafari WebDriver smoke test failed. Expand failing step and download safari-webdriver-logs artifact.\033[0m\n'
+          echo '::error::Safari WebDriver smoke test failed. See HTTP response bodies and safari-webdriver-logs artifact.'
+          echo '### Safari WebDriver failed' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Expand the failing step for HTTP status, response body, and exit code. Download the safari-webdriver-logs artifact for full diagnostics.' >> "$GITHUB_STEP_SUMMARY"
